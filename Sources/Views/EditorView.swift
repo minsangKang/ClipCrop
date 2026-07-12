@@ -87,14 +87,24 @@ struct EditorView: View {
 
     // MARK: - 레벨(톤 보정) 바
 
-    /// crop이 HDR 색을 물빠지게 만드는 걸 눈으로 보면서 보정하는 감마 슬라이더.
+    /// crop이 HDR 색을 물빠지게 만드는 걸 눈으로 보면서 보정하는, 애플 사진 앱 스타일 슬라이더 7종.
     /// 미리보기와 내보내기가 같은 CropVideoComposition을 쓰므로 여기서 맞춘 값이 그대로 내보내진다.
+    private static let levelsGridColumns = [
+        GridItem(.flexible(), spacing: 24, alignment: .leading),
+        GridItem(.flexible(), spacing: 24, alignment: .leading)
+    ]
+
     @ViewBuilder
     private var levelsBar: some View {
         if state.cropAspect != .none {
-            HStack(spacing: 20) {
-                levelsSlider(title: "감마", value: $state.levels.gamma, range: 0.5...2.0, resetValue: 1.0)
-                Spacer()
+            LazyVGrid(columns: Self.levelsGridColumns, alignment: .leading, spacing: 6) {
+                levelsSlider(title: "노출", value: $state.levels.exposure, range: -1...1, resetValue: 0)
+                levelsSlider(title: "하이라이트", value: $state.levels.highlights, range: -1...1, resetValue: 0)
+                levelsSlider(title: "그림자", value: $state.levels.shadows, range: -1...1, resetValue: 0)
+                levelsSlider(title: "대비", value: $state.levels.contrast, range: -1...1, resetValue: 0)
+                levelsSlider(title: "밝기", value: $state.levels.brightness, range: -1...1, resetValue: 0)
+                levelsSlider(title: "블랙 포인트", value: $state.levels.blackPoint, range: -1...1, resetValue: 0)
+                levelsSlider(title: "휘도", value: $state.levels.brilliance, range: -1...1, resetValue: 0)
             }
             .padding(.horizontal, 12)
             .padding(.bottom, 8)
@@ -107,9 +117,18 @@ struct EditorView: View {
             Text(title)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .frame(width: 52, alignment: .leading)
+                .frame(width: 64, alignment: .leading)
+            Button {
+                value.wrappedValue = resetValue
+            } label: {
+                Image(systemName: "arrow.counterclockwise")
+                    .font(.caption2)
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(value.wrappedValue == resetValue ? .tertiary : .secondary)
+            .disabled(value.wrappedValue == resetValue)
+            .help("기본값으로 초기화")
             Slider(value: value, in: range)
-                .frame(width: 110)
                 .onTapGesture(count: 2) { value.wrappedValue = resetValue }
                 .help("더블클릭하면 기본값으로 초기화")
             Text(String(format: "%.2f", value.wrappedValue))

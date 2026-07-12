@@ -21,7 +21,15 @@ final class EditState: ObservableObject {
         didSet { resetCropRect() }
     }
     /// 영상 표시 영역 기준 정규화(0~1) crop 사각형. 좌상단 원점.
-    @Published var cropRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+    @Published var cropRect = CGRect(x: 0, y: 0, width: 1, height: 1) {
+        didSet { updatePreviewVideoComposition() }
+    }
+    /// crop 후 물빠진 색을 보정하는 톤 조정(LumaFusion "레벨"의 입력 검은점/흰점/감마).
+    /// 미리보기와 내보내기가 CropVideoComposition을 공유해서 쓰므로, 편집 화면에서
+    /// 눈으로 맞춘 값이 내보내기 결과에 그대로 반영된다.
+    @Published var levels = Levels() {
+        didSet { updatePreviewVideoComposition() }
+    }
 
     @Published var isExporting = false
     @Published var exportProgress: Double = 0
@@ -287,12 +295,36 @@ final class EditState: ObservableObject {
         do {
             let composition = try await Self.makeComposition(from: asset, keptRanges: segments.map(\.sourceRange))
             let item = AVPlayerItem(asset: composition)
+            item.videoComposition = try await makePreviewVideoComposition(for: composition)
             player.replaceCurrentItem(with: item)
             if let compTime {
                 seek(toCompositionTime: compTime)
             }
         } catch {
             loadError = "미리보기 구성 실패: \(error.localizedDescription)"
+        }
+    }
+
+    /// crop 사각형이 없으면 nil(원본 그대로 재생), 있으면 내보내기와 동일한
+    /// CropVideoComposition을 적용해 crop·레벨 조정이 실제로 어떻게 나올지 미리 보여준다.
+    private func makePreviewVideoComposition(for composition: AVAsset) async throws -> AVVideoComposition? {
+        guard cropAspect != .none,
+              let videoTrack = try await composition.loadTracks(withMediaType: .video).first else {
+            return nil
+        }
+        let pixelCrop = VideoGeometry.pixelCropRect(normalized: cropRect, displaySize: displaySize)
+        return try await CropVideoComposition.make(asset: composition, videoTrack: videoTrack,
+                                                    pixelCrop: pixelCrop, levels: levels)
+    }
+
+    /// crop 사각형이나 감마 값만 바뀌었을 때, 플레이어 아이템을 새로 만들지 않고
+    /// videoComposition만 다시 계산해 끊김 없이 미리보기에 반영한다.
+    private func updatePreviewVideoComposition() {
+        guard let item = player.currentItem else { return }
+        let itemAsset = item.asset
+        Task {
+            let composition = try? await makePreviewVideoComposition(for: itemAsset)
+            item.videoComposition = composition
         }
     }
 

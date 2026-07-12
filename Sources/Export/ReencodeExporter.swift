@@ -2,8 +2,8 @@ import AVFoundation
 
 /// crop 저장: 영상만 Apple HEVC 파이프라인으로 재인코딩하고,
 /// 오디오는 원본에서 비트 그대로 무손실 복사한 뒤 한 파일로 합친다.
-/// - 기하 변환만 쓰는 videoComposition은 built-in compositor가 HDR을 그대로 통과시키며,
-///   소스가 Dolby Vision 8.4이면 HEVC 프리셋 출력도 DV 8.4로 유지된다.
+/// - crop(+레벨 보정)은 CropVideoComposition으로 렌더링한다 — 미리보기 플레이어도 동일한
+///   함수를 쓰므로 편집 화면에서 본 색감이 내보내기 결과에 그대로 반영된다(WYSIWYG).
 /// - 오디오를 재인코딩하지 않으므로 음질 손실·글리치가 없고 공간 음향 트랙도 전부 보존된다.
 enum ReencodeExporter {
     struct ExportError: LocalizedError {
@@ -15,7 +15,7 @@ enum ReencodeExporter {
                        keptRanges: [CMTimeRange],
                        cropRectNormalized: CGRect,
                        displaySize: CGSize,
-                       displayTransform: CGAffineTransform,
+                       levels: Levels,
                        to outputURL: URL,
                        onProgress: @escaping @Sendable (Double) -> Void) async throws {
         if FileManager.default.fileExists(atPath: outputURL.path) {
@@ -31,7 +31,7 @@ enum ReencodeExporter {
                                      keptRanges: keptRanges,
                                      cropRectNormalized: cropRectNormalized,
                                      displaySize: displaySize,
-                                     displayTransform: displayTransform,
+                                     levels: levels,
                                      to: tempURL) { progress in
             onProgress(progress * 0.95)
         }
@@ -48,7 +48,7 @@ enum ReencodeExporter {
                                            keptRanges: [CMTimeRange],
                                            cropRectNormalized: CGRect,
                                            displaySize: CGSize,
-                                           displayTransform: CGAffineTransform,
+                                           levels: Levels,
                                            to outputURL: URL,
                                            onProgress: @escaping @Sendable (Double) -> Void) async throws {
         let composition = try await EditState.makeComposition(from: asset, keptRanges: keptRanges,
@@ -58,38 +58,8 @@ enum ReencodeExporter {
         }
 
         let pixelCrop = VideoGeometry.pixelCropRect(normalized: cropRectNormalized, displaySize: displaySize)
-
-        // 회전 보정 변환 뒤에 crop 원점 이동을 이어붙여, crop 영역이 출력 원점에 오도록 한다
-        let cropTransform = displayTransform.concatenating(
-            CGAffineTransform(translationX: -pixelCrop.minX, y: -pixelCrop.minY)
-        )
-
-        // propertiesOf:가 프레임레이트·색 속성(HDR 포함)을 소스에서 그대로 가져온다
-        let videoComposition = try await AVMutableVideoComposition.videoComposition(withPropertiesOf: composition)
-        videoComposition.renderSize = pixelCrop.size
-
-        // 색 공간을 소스와 동일하게 명시하지 않으면 컴포지터가 BT.709(SDR) 작업 색공간으로
-        // 렌더링해 HDR 색이 물빠져 보인다 — 원본 트랙의 색 속성을 그대로 강제한다
-        if let sourceTrack = try await asset.loadTracks(withMediaType: .video).first,
-           let formatDesc = try await sourceTrack.load(.formatDescriptions).first {
-            let ext = CMFormatDescriptionGetExtensions(formatDesc) as? [String: Any]
-            if let primaries = ext?[kCMFormatDescriptionExtension_ColorPrimaries as String] as? String {
-                videoComposition.colorPrimaries = primaries
-            }
-            if let transfer = ext?[kCMFormatDescriptionExtension_TransferFunction as String] as? String {
-                videoComposition.colorTransferFunction = transfer
-            }
-            if let matrix = ext?[kCMFormatDescriptionExtension_YCbCrMatrix as String] as? String {
-                videoComposition.colorYCbCrMatrix = matrix
-            }
-        }
-
-        let instruction = AVMutableVideoCompositionInstruction()
-        instruction.timeRange = CMTimeRange(start: .zero, duration: composition.duration)
-        let layerInstruction = AVMutableVideoCompositionLayerInstruction(assetTrack: videoTrack)
-        layerInstruction.setTransform(cropTransform, at: .zero)
-        instruction.layerInstructions = [layerInstruction]
-        videoComposition.instructions = [instruction]
+        let videoComposition = try await CropVideoComposition.make(asset: composition, videoTrack: videoTrack,
+                                                                    pixelCrop: pixelCrop, levels: levels)
 
         guard let session = AVAssetExportSession(asset: composition,
                                                  presetName: AVAssetExportPresetHEVCHighestQuality) else {

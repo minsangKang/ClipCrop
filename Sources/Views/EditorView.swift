@@ -12,6 +12,7 @@ struct EditorView: View {
         VStack(spacing: 0) {
             playerArea
             transportBar
+            levelsBar
             TimelineView(state: state)
                 .padding(.horizontal, 12)
                 .padding(.bottom, 12)
@@ -82,6 +83,40 @@ struct EditorView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+    }
+
+    // MARK: - 레벨(톤 보정) 바
+
+    /// crop이 HDR 색을 물빠지게 만드는 걸 눈으로 보면서 보정하는 감마 슬라이더.
+    /// 미리보기와 내보내기가 같은 CropVideoComposition을 쓰므로 여기서 맞춘 값이 그대로 내보내진다.
+    @ViewBuilder
+    private var levelsBar: some View {
+        if state.cropAspect != .none {
+            HStack(spacing: 20) {
+                levelsSlider(title: "감마", value: $state.levels.gamma, range: 0.5...2.0, resetValue: 1.0)
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 8)
+        }
+    }
+
+    private func levelsSlider(title: String, value: Binding<Double>,
+                              range: ClosedRange<Double>, resetValue: Double) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 52, alignment: .leading)
+            Slider(value: value, in: range)
+                .frame(width: 110)
+                .onTapGesture(count: 2) { value.wrappedValue = resetValue }
+                .help("더블클릭하면 기본값으로 초기화")
+            Text(String(format: "%.2f", value.wrappedValue))
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(width: 34, alignment: .leading)
+        }
     }
 
     // MARK: - 툴바
@@ -170,7 +205,7 @@ struct EditorView: View {
                         keptRanges: keptRanges,
                         cropRectNormalized: state.cropRect,
                         displaySize: state.displaySize,
-                        displayTransform: state.displayTransform,
+                        levels: state.levels,
                         to: outputURL
                     ) { progress in
                         Task { @MainActor in

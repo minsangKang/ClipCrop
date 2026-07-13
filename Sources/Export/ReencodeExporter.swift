@@ -16,6 +16,7 @@ enum ReencodeExporter {
                        cropRectNormalized: CGRect,
                        displaySize: CGSize,
                        levels: Levels,
+                       mosaicRegions: [MosaicRegion],
                        to outputURL: URL,
                        onProgress: @escaping @Sendable (Double) -> Void) async throws {
         if FileManager.default.fileExists(atPath: outputURL.path) {
@@ -32,6 +33,7 @@ enum ReencodeExporter {
                                      cropRectNormalized: cropRectNormalized,
                                      displaySize: displaySize,
                                      levels: levels,
+                                     mosaicRegions: mosaicRegions,
                                      to: tempURL) { progress in
             onProgress(progress * 0.95)
         }
@@ -49,6 +51,7 @@ enum ReencodeExporter {
                                            cropRectNormalized: CGRect,
                                            displaySize: CGSize,
                                            levels: Levels,
+                                           mosaicRegions: [MosaicRegion],
                                            to outputURL: URL,
                                            onProgress: @escaping @Sendable (Double) -> Void) async throws {
         let composition = try await EditState.makeComposition(from: asset, keptRanges: keptRanges,
@@ -59,7 +62,8 @@ enum ReencodeExporter {
 
         let pixelCrop = VideoGeometry.pixelCropRect(normalized: cropRectNormalized, displaySize: displaySize)
         let videoComposition = try await CropVideoComposition.make(asset: composition, videoTrack: videoTrack,
-                                                                    pixelCrop: pixelCrop, levels: levels)
+                                                                    pixelCrop: pixelCrop, displaySize: displaySize,
+                                                                    levels: levels, mosaicRegions: mosaicRegions)
 
         guard let session = AVAssetExportSession(asset: composition,
                                                  presetName: AVAssetExportPresetHEVCHighestQuality) else {

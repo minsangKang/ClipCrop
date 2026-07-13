@@ -13,6 +13,7 @@ struct EditorView: View {
             playerArea
             transportBar
             levelsBar
+            mosaicBar
             TimelineView(state: state)
                 .padding(.horizontal, 12)
                 .padding(.bottom, 12)
@@ -44,9 +45,21 @@ struct EditorView: View {
             let bounds = CGRect(origin: .zero, size: geo.size)
             let videoRect = VideoGeometry.videoRect(displaySize: state.displaySize, in: bounds)
             ZStack(alignment: .topLeading) {
+                // PlayerView 프레임을 videoRect에 정확히 맞춘다 — AVPlayerView가 내부적으로
+                // 따로 letterbox 계산을 하게 두면(.resizeAspect) 창 크기가 실시간으로 바뀔 때
+                // 그 계산이 SwiftUI 쪽 오버레이 좌표 계산과 다른 렌더 타이밍에 갱신되면서
+                // crop/모자이크 사각형이 비디오와 따로 노는 것처럼 어긋나 보인다. 여기서 프레임을
+                // 직접 videoRect로 잘라주면 두 계산이 완전히 같은 값을 공유해 어긋날 수가 없다.
                 PlayerView(player: state.player)
+                    .frame(width: videoRect.width, height: videoRect.height)
+                    .offset(x: videoRect.minX, y: videoRect.minY)
                 if state.cropAspect != .none {
                     CropOverlayView(state: state, videoRect: videoRect)
+                        // 모자이크 블록이 있을 땐 crop 드래그가 그 위 터치를 가로채지 않도록 완전히 끈다.
+                        .allowsHitTesting(state.mosaicRegions.isEmpty)
+                }
+                if !state.mosaicRegions.isEmpty {
+                    MosaicOverlayView(state: state, videoRect: videoRect)
                 }
             }
         }
@@ -138,6 +151,36 @@ struct EditorView: View {
         }
     }
 
+    // MARK: - 모자이크 바
+
+    /// 선택된 모자이크 블록의 불투명도/코너 라운드를 조절하고 삭제할 수 있는 바.
+    /// 여러 블록이 있어도 한 번에 하나씩만 편집 — 플레이어 위에서 탭해 선택을 바꾼다.
+    @ViewBuilder
+    private var mosaicBar: some View {
+        if let id = state.selectedMosaicID,
+           let index = state.mosaicRegions.firstIndex(where: { $0.id == id }) {
+            let region = $state.mosaicRegions[index]
+            HStack(spacing: 16) {
+                Text("모자이크 \(index + 1)/\(state.mosaicRegions.count)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 88, alignment: .leading)
+                levelsSlider(title: "불투명도", value: region.opacity, range: 0...1, resetValue: 1.0)
+                levelsSlider(title: "코너 라운드", value: region.cornerRadius, range: 0...1, resetValue: 0.15)
+                Spacer()
+                Button(role: .destructive) {
+                    state.removeMosaicRegion(id: id)
+                } label: {
+                    Label("삭제", systemImage: "trash")
+                }
+                .buttonStyle(.borderless)
+                .help("이 모자이크 블록 삭제")
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 8)
+        }
+    }
+
     // MARK: - 툴바
 
     @ToolbarContentBuilder
@@ -161,6 +204,13 @@ struct EditorView: View {
             }
             .pickerStyle(.segmented)
             .help("crop 비율 선택")
+
+            Button {
+                state.addMosaicRegion()
+            } label: {
+                Label("모자이크 추가", systemImage: "checkerboard.rectangle")
+            }
+            .help("고정 위치 모자이크 블록 추가 (여러 개 추가 가능)")
 
             Button {
                 state.undo()
@@ -209,22 +259,23 @@ struct EditorView: View {
         guard panel.runModal() == .OK, let outputURL = panel.url else { return }
 
         let keptRanges = state.segments.map(\.sourceRange)
-        let useCrop = state.cropAspect != .none
+        let useEffects = state.cropAspect != .none || !state.mosaicRegions.isEmpty
         state.isExporting = true
         state.exportProgress = 0
         state.exportETA = nil
-        state.exportMessage = useCrop ? "HDR 보존 재인코딩 중…" : "무손실 저장 중…"
+        state.exportMessage = useEffects ? "HDR 보존 재인코딩 중…" : "무손실 저장 중…"
 
         let exportStart = Date()
         state.exportTask = Task {
             do {
-                if useCrop {
+                if useEffects {
                     try await ReencodeExporter.export(
                         asset: state.asset,
                         keptRanges: keptRanges,
                         cropRectNormalized: state.cropRect,
                         displaySize: state.displaySize,
                         levels: state.levels,
+                        mosaicRegions: state.mosaicRegions,
                         to: outputURL
                     ) { progress in
                         Task { @MainActor in
@@ -301,11 +352,17 @@ struct EditorView: View {
         onOpenProject(url)
     }
 
+    /// crop이나 모자이크 중 하나라도 있으면 재인코딩 경로(ReencodeExporter)를 타므로
+    /// 퍼센트 진행률/취소가 의미 있다. 둘 다 없으면 무손실 스트림 복사라 진행률을 알 수 없다.
+    private var usesReencodePath: Bool {
+        state.cropAspect != .none || !state.mosaicRegions.isEmpty
+    }
+
     @ViewBuilder
     private var exportOverlay: some View {
         if state.isExporting {
             VStack(spacing: 12) {
-                if state.cropAspect != .none {
+                if usesReencodePath {
                     ProgressView(value: state.exportProgress)
                         .frame(width: 240)
                     HStack(spacing: 8) {
@@ -321,7 +378,7 @@ struct EditorView: View {
                 }
                 Text(state.exportMessage ?? "저장 중…")
                     .foregroundStyle(.secondary)
-                if state.cropAspect != .none {
+                if usesReencodePath {
                     Button("중단", role: .destructive) {
                         state.exportTask?.cancel()
                     }

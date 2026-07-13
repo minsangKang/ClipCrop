@@ -31,6 +31,13 @@ final class EditState: ObservableObject {
         didSet { updatePreviewVideoComposition() }
     }
 
+    /// 고정 위치 모자이크 블록들. crop과 무관하게 독립적으로 동작한다(crop을 안 써도 모자이크만 낼 수 있음).
+    /// 좌표계는 cropRect와 동일 — 영상 표시 영역 기준 정규화(0~1), 좌상단 원점.
+    @Published var mosaicRegions: [MosaicRegion] = [] {
+        didSet { updatePreviewVideoComposition() }
+    }
+    @Published var selectedMosaicID: UUID?
+
     @Published var isExporting = false
     @Published var exportProgress: Double = 0
     @Published var exportMessage: String?
@@ -248,6 +255,26 @@ final class EditState: ObservableObject {
         cropRect = CGRect(x: (1 - w) / 2, y: (1 - h) / 2, width: w, height: h)
     }
 
+    // MARK: - 모자이크
+
+    /// 새 모자이크 블록을 추가하고 바로 선택 상태로 만든다. 여러 개를 추가해도 서로 겹치지
+    /// 않게 대각선으로 살짝씩 어긋난 위치에 놓는다 — 겹쳐서 하나만 보이는 걸 방지.
+    func addMosaicRegion() {
+        let size: CGFloat = 0.22
+        let step: CGFloat = 0.06
+        let offset = CGFloat(mosaicRegions.count % 6) * step
+        let origin = min(0.5 - size / 2 + offset, 1 - size)
+        let rect = CGRect(x: max(0, origin), y: max(0, origin), width: size, height: size)
+        let region = MosaicRegion(rect: rect)
+        mosaicRegions.append(region)
+        selectedMosaicID = region.id
+    }
+
+    func removeMosaicRegion(id: UUID) {
+        mosaicRegions.removeAll { $0.id == id }
+        if selectedMosaicID == id { selectedMosaicID = nil }
+    }
+
     // MARK: - 프로젝트 저장/불러오기
 
     func makeProjectFile() -> ProjectFile {
@@ -305,19 +332,21 @@ final class EditState: ObservableObject {
         }
     }
 
-    /// crop 사각형이 없으면 nil(원본 그대로 재생), 있으면 내보내기와 동일한
-    /// CropVideoComposition을 적용해 crop·레벨 조정이 실제로 어떻게 나올지 미리 보여준다.
+    /// crop도 모자이크도 없으면 nil(원본 그대로 재생), 하나라도 있으면 내보내기와 동일한
+    /// CropVideoComposition을 적용해 실제로 어떻게 나올지 미리 보여준다.
+    /// crop을 안 쓸 때도 cropRect는 항상 (0,0,1,1)(전체 프레임)이라 pixelCrop 계산이 그대로 통한다.
     private func makePreviewVideoComposition(for composition: AVAsset) async throws -> AVVideoComposition? {
-        guard cropAspect != .none,
+        guard cropAspect != .none || !mosaicRegions.isEmpty,
               let videoTrack = try await composition.loadTracks(withMediaType: .video).first else {
             return nil
         }
         let pixelCrop = VideoGeometry.pixelCropRect(normalized: cropRect, displaySize: displaySize)
         return try await CropVideoComposition.make(asset: composition, videoTrack: videoTrack,
-                                                    pixelCrop: pixelCrop, levels: levels)
+                                                    pixelCrop: pixelCrop, displaySize: displaySize,
+                                                    levels: levels, mosaicRegions: mosaicRegions)
     }
 
-    /// crop 사각형이나 감마 값만 바뀌었을 때, 플레이어 아이템을 새로 만들지 않고
+    /// crop, 레벨, 모자이크 중 하나라도 바뀌었을 때, 플레이어 아이템을 새로 만들지 않고
     /// videoComposition만 다시 계산해 끊김 없이 미리보기에 반영한다.
     private func updatePreviewVideoComposition() {
         guard let item = player.currentItem else { return }

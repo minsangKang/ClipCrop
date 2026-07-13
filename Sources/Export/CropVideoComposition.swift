@@ -19,7 +19,7 @@ struct Levels: Equatable {
     }
 }
 
-/// crop과 감마 조정을 함께 적용하는 AVVideoComposition을 만든다.
+/// crop, 톤 조정(levels), 모자이크를 함께 적용하는 AVVideoComposition을 만든다.
 /// 미리보기(AVPlayerItem)와 내보내기(AVAssetExportSession) 양쪽에서 이 함수를 그대로 써서,
 /// 편집 화면에서 본 색감이 내보내기 결과에 그대로 반영되게 한다(WYSIWYG).
 ///
@@ -36,10 +36,15 @@ enum CropVideoComposition {
     ///   - asset: crop을 적용할 대상(미리보기의 트림된 컴포지션, 또는 내보내기의 트림된 컴포지션)
     ///   - videoTrack: asset의 비디오 트랙 (색 속성을 읽어온다)
     ///   - pixelCrop: 표시 좌표계 기준 crop 사각형. asset의 preferredTransform이 이미 적용된
-    ///     좌표계이므로 회전을 별도로 보정할 필요가 없다.
+    ///     좌표계이므로 회전을 별도로 보정할 필요가 없다. crop을 안 쓰는 경우에도 항상
+    ///     전체 프레임 픽셀 사각형이 들어온다(EditState.cropRect가 그 경우 (0,0,1,1)이므로).
+    ///   - displaySize: crop 전 원본 표시 크기(픽셀). mosaicRegions는 이 좌표계 기준 정규화 값이라
+    ///     pixelCrop과 별도로 필요하다.
     ///   - levels: 애플 사진 앱 스타일 톤 조정. isNeutral이면 필터를 아예 적용하지 않는다.
+    ///   - mosaicRegions: 고정 위치 모자이크 블록들. crop 영역 밖으로 벗어난 블록은 자동으로 무시된다.
     static func make(asset: AVAsset, videoTrack: AVAssetTrack,
-                     pixelCrop: CGRect, levels: Levels) async throws -> AVMutableVideoComposition {
+                     pixelCrop: CGRect, displaySize: CGSize,
+                     levels: Levels, mosaicRegions: [MosaicRegion]) async throws -> AVMutableVideoComposition {
         var colorPrimaries: String?
         var colorTransfer: String?
         var colorMatrix: String?
@@ -50,13 +55,23 @@ enum CropVideoComposition {
             colorMatrix = ext?[kCMFormatDescriptionExtension_YCbCrMatrix as String] as? String
         }
 
-        let translation = CGAffineTransform(translationX: -pixelCrop.minX, y: -pixelCrop.minY)
+        // Core Image의 좌표계는 원점이 좌하단(y가 위로 증가)인데, pixelCrop은 좌상단 원점(y가
+        // 아래로 증가)인 화면 좌표계 기준이라 y를 그대로 빼면 위아래가 뒤집힌다. 좌상단 기준 y를
+        // 좌하단 기준으로 뒤집으려면 "위에서부터의 거리(minY)"가 아니라 "아래에서부터의 거리
+        // (displaySize.height - maxY)"를 옮겨야 한다. 가운데 정렬된 crop은 위아래 여백이 같아서
+        // 이 버그가 우연히 티가 안 났을 뿐, 중심을 벗어난 crop이나 모자이크에서는 뒤집혀 보인다.
+        let translation = CGAffineTransform(translationX: -pixelCrop.minX,
+                                            y: pixelCrop.maxY - displaySize.height)
         let croppedExtent = CGRect(origin: .zero, size: pixelCrop.size)
 
         let videoComposition = AVMutableVideoComposition(asset: asset) { request in
             var image = request.sourceImage.transformed(by: translation).cropped(to: croppedExtent)
             if !levels.isNeutral {
                 image = applyLevels(levels, to: image)
+            }
+            if !mosaicRegions.isEmpty {
+                image = applyMosaics(mosaicRegions, displaySize: displaySize,
+                                     pixelCrop: pixelCrop, croppedExtent: croppedExtent, to: image)
             }
             request.finish(with: image, context: nil)
         }
@@ -65,6 +80,46 @@ enum CropVideoComposition {
         if let colorTransfer { videoComposition.colorTransferFunction = colorTransfer }
         if let colorMatrix { videoComposition.colorYCbCrMatrix = colorMatrix }
         return videoComposition
+    }
+
+    /// 각 모자이크 블록을 라운드 사각형 알파 마스크로 만들어, 가우시안 블러(뿌옇게) 처리한 이미지를
+    /// 그 마스크 알파(= opacity)만큼 원본 위에 덮어씌운다. 여러 개면 순서대로 누적 합성한다.
+    private static func applyMosaics(_ regions: [MosaicRegion], displaySize: CGSize,
+                                     pixelCrop: CGRect, croppedExtent: CGRect,
+                                     to source: CIImage) -> CIImage {
+        var image = source
+        for region in regions {
+            // mosaicRegion.rect는 crop 전 전체 표시 영역 기준(좌상단 원점) 정규화 좌표라, crop과
+            // 동일한 픽셀 변환(even 정렬)을 거친 뒤 좌하단 원점(Core Image) 기준으로 y를 뒤집고,
+            // crop 원점만큼 다시 빼서 croppedExtent 기준 로컬 좌표로 옮긴다. x는 뒤집을 필요 없다.
+            let fullPixelRect = VideoGeometry.pixelCropRect(normalized: region.rect, displaySize: displaySize)
+            let localRect = CGRect(x: fullPixelRect.minX - pixelCrop.minX,
+                                   y: pixelCrop.maxY - fullPixelRect.maxY,
+                                   width: fullPixelRect.width,
+                                   height: fullPixelRect.height)
+            guard localRect.intersects(croppedExtent), region.opacity > 0 else { continue }
+
+            let radius = region.cornerRadius * min(localRect.width, localRect.height) / 2
+            let maskColor = CIColor(red: 1, green: 1, blue: 1, alpha: region.opacity)
+            guard let mask = CIFilter(name: "CIRoundedRectangleGenerator", parameters: [
+                "inputExtent": CIVector(cgRect: localRect),
+                "inputRadius": radius,
+                "inputColor": maskColor
+            ])?.outputImage?.cropped(to: croppedExtent) else { continue }
+
+            // 블록 크기에 비례한 블러 반경 — CIGaussianBlur는 extent 밖 픽셀도 샘플링하므로
+            // clampedToExtent로 가장자리 검은 테두리(비네팅)를 막은 뒤 다시 잘라낸다.
+            let blurRadius = max(6, min(localRect.width, localRect.height) * 0.15)
+            let blurred = image.clampedToExtent()
+                .applyingFilter("CIGaussianBlur", parameters: ["inputRadius": blurRadius])
+                .cropped(to: croppedExtent)
+
+            image = blurred.applyingFilter("CIBlendWithAlphaMask", parameters: [
+                "inputBackgroundImage": image,
+                "inputMaskImage": mask
+            ])
+        }
+        return image
     }
 
     /// 애플 사진 앱 "라이트" 패널 순서(노출→블랙 포인트→그림자/하이라이트→대비→밝기→휘도)를 따라

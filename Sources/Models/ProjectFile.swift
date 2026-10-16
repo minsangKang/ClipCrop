@@ -33,6 +33,8 @@ struct ProjectFile: Codable {
     var segments: [SegmentData]
     var cropAspect: String
     var cropRect: RectData
+    /// 배속(1 = 원본 속도). 이 필드가 없던 옛 프로젝트 파일도 그대로 열 수 있게 옵셔널이다.
+    var speed: Double?
 
     func write(to url: URL) throws {
         let encoder = JSONEncoder()

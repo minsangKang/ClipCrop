@@ -38,6 +38,16 @@ final class EditState: ObservableObject {
     }
     @Published var selectedMosaicID: UUID?
 
+    /// 배속. 미리보기는 player.rate로 즉시 반영하고, 내보내기는 컴포지션을 scaleTimeRange로
+    /// 늘이거나 줄여서 같은 결과를 만든다. 세그먼트·타임라인 시간은 항상 원본 속도 기준이라
+    /// 배속을 바꿔도 편집 내용(자른 구간)은 그대로 유지된다.
+    @Published var speed: PlaybackSpeed = .normal {
+        didSet {
+            guard speed != oldValue, isPlaying else { return }
+            player.rate = Float(speed.value)
+        }
+    }
+
     @Published var isExporting = false
     @Published var exportProgress: Double = 0
     @Published var exportMessage: String?
@@ -52,6 +62,8 @@ final class EditState: ObservableObject {
     private(set) var displaySize: CGSize = .zero
     private(set) var displayTransform: CGAffineTransform = .identity
     private(set) var sourceDuration: CMTime = .zero
+    /// 원본 프레임레이트. 배속을 걸면 출력은 이 값 × 배속이 된다(프레임을 버리지 않으므로).
+    private(set) var sourceFPS: Double = 0
 
     private var timeObserver: Any?
     private var endObserver: NSObjectProtocol?
@@ -75,6 +87,7 @@ final class EditState: ObservableObject {
             }
             let (size, transform) = try await VideoGeometry.displayInfo(for: videoTrack)
             sourceDuration = duration
+            sourceFPS = Double(try await videoTrack.load(.nominalFrameRate))
             displaySize = size
             displayTransform = transform
             segments = [Segment(sourceRange: CMTimeRange(start: .zero, duration: duration))]
@@ -100,10 +113,19 @@ final class EditState: ObservableObject {
 
     // MARK: - 타임라인 계산
 
-    /// 남은 구간 전체 길이
+    /// 남은 구간 전체 길이 (원본 속도 기준 — 타임라인·재생헤드가 쓰는 시간축)
     var totalDuration: CMTime {
         segments.reduce(.zero) { CMTimeAdd($0, $1.sourceRange.duration) }
     }
+
+    /// 배속을 적용해 실제로 저장될 영상 길이
+    var outputDuration: CMTime {
+        CMTimeMultiplyByFloat64(totalDuration, multiplier: 1 / speed.value)
+    }
+
+    /// 배속을 적용해 실제로 저장될 프레임레이트. 프레임을 솎아내지 않고 간격만 좁히므로
+    /// 원본 fps에 배속을 곱한 값이 된다 (30fps 원본을 1.1배속 → 33fps).
+    var outputFPS: Int { Int((sourceFPS * speed.value).rounded()) }
 
     /// 컴포지션 시간 → 원본 시간
     func sourceTime(forCompositionTime t: CMTime) -> CMTime {
@@ -234,7 +256,7 @@ final class EditState: ObservableObject {
             if CMTimeCompare(currentTime, totalDuration) >= 0 {
                 seek(toCompositionTime: .zero)
             }
-            player.play()
+            player.rate = Float(speed.value)   // play()와 달리 배속을 그대로 적용해 재생 시작
             isPlaying = true
         }
     }
@@ -286,7 +308,8 @@ final class EditState: ObservableObject {
             },
             cropAspect: cropAspect.rawValue,
             cropRect: ProjectFile.RectData(x: cropRect.minX, y: cropRect.minY,
-                                           width: cropRect.width, height: cropRect.height)
+                                           width: cropRect.width, height: cropRect.height),
+            speed: speed.value
         )
     }
 
@@ -306,6 +329,8 @@ final class EditState: ObservableObject {
         redoStack.removeAll()
         updateUndoFlags()
 
+        speed = PlaybackSpeed(value: project.speed ?? 1)
+
         // cropAspect의 didSet이 cropRect를 초기화하므로 aspect를 먼저 설정한다
         cropAspect = CropAspect(rawValue: project.cropAspect) ?? .none
         if cropAspect != .none {
@@ -322,6 +347,8 @@ final class EditState: ObservableObject {
         do {
             let composition = try await Self.makeComposition(from: asset, keptRanges: segments.map(\.sourceRange))
             let item = AVPlayerItem(asset: composition)
+            // 배속 재생 시 음정이 변하지 않게 — 내보내기 세션도 같은 알고리즘을 쓴다.
+            item.audioTimePitchAlgorithm = .spectral
             item.videoComposition = try await makePreviewVideoComposition(for: composition)
             player.replaceCurrentItem(with: item)
             if let compTime {
@@ -358,8 +385,12 @@ final class EditState: ObservableObject {
     }
 
     /// 남은 구간들을 이어붙인 AVMutableComposition (미리보기·재인코딩 내보내기 공용)
+    /// - Parameter speed: 1이 아니면 이어붙인 전체 구간을 그만큼 빠르게/느리게 스케일한다.
+    ///   내보내기에서만 쓰고, 미리보기는 player.rate로 같은 효과를 낸다 — 미리보기 컴포지션을
+    ///   스케일해버리면 타임라인·재생헤드의 시간 계산이 전부 배속 시간축으로 바뀌어버리기 때문.
     static func makeComposition(from asset: AVURLAsset, keptRanges: [CMTimeRange],
-                                includeAudio: Bool = true) async throws -> AVMutableComposition {
+                                includeAudio: Bool = true,
+                                speed: Double = 1) async throws -> AVMutableComposition {
         let composition = AVMutableComposition()
         let videoTracks = try await asset.loadTracks(withMediaType: .video)
         let audioTracks = try await asset.loadTracks(withMediaType: .audio)
@@ -368,6 +399,14 @@ final class EditState: ObservableObject {
         if let v = videoTracks.first,
            let dest = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) {
             dest.preferredTransform = try await v.load(.preferredTransform)
+            // 배속을 걸면 프레임 간격이 1/(원본fps × 배속)초가 되는데, 기본 타임스케일 600으로는
+            // 1/33초 같은 값이 딱 떨어지지 않아 프레임 간격이 30.0ms/31.7ms로 섞인다. 목표
+            // 프레임레이트의 배수로 타임스케일을 잡아주면 간격이 완전히 균일해진다.
+            // (삽입 전에 지정해야 삽입되는 구간의 시간도 이 눈금에 맞춰진다.)
+            let fps = Double(try await v.load(.nominalFrameRate))
+            if speed != 1, fps > 0 {
+                dest.naturalTimeScale = CMTimeScale((fps * speed * 100).rounded())
+            }
             trackPairs.append((v, dest))
         }
         if includeAudio, let a = audioTracks.first,
@@ -381,6 +420,10 @@ final class EditState: ObservableObject {
                 try dest.insertTimeRange(range, of: source, at: cursor)
             }
             cursor = CMTimeAdd(cursor, range.duration)
+        }
+        if speed != 1, cursor.seconds > 0 {
+            composition.scaleTimeRange(CMTimeRange(start: .zero, duration: cursor),
+                                       toDuration: CMTimeMultiplyByFloat64(cursor, multiplier: 1 / speed))
         }
         return composition
     }

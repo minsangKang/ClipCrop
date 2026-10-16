@@ -30,6 +30,10 @@ struct ContentView: View {
             Button("영상 열기…") { showImporter = true }
                 .keyboardShortcut("o", modifiers: .command)
             Button("편집 프로젝트 불러오기…") { showProjectImporter = true }
+            Text("ClipCrop \(AppInfo.version)")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .padding(.top, 8)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(isDropTargeted ? Color.accentColor.opacity(0.1) : Color.clear)

@@ -30,6 +30,7 @@ struct EditorView: View {
         .onAppear { editorFocused = true }
         .toolbar { toolbarContent }
         .navigationTitle(state.sourceURL.lastPathComponent)
+        .navigationSubtitle("ClipCrop \(AppInfo.version)")
         .overlay { exportOverlay }
         .alert("오류", isPresented: .constant(state.loadError != nil)) {
             Button("확인") { state.loadError = nil }
@@ -83,6 +84,24 @@ struct EditorView: View {
             Text("\(format(state.currentTime)) / \(format(state.totalDuration))")
                 .font(.system(.body, design: .monospaced))
                 .foregroundStyle(.secondary)
+
+            Picker("배속", selection: $state.speed) {
+                ForEach(PlaybackSpeed.allCases) { speed in
+                    Text(speed.rawValue).tag(speed)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 300)
+            .help("재생·저장 배속. 프레임을 하나도 버리지 않고 간격만 좁혀서 저장하므로 "
+                  + "모션이 튀지 않습니다")
+
+            if state.speed != .normal {
+                Text("→ \(format(state.outputDuration)) · \(state.outputFPS)fps")
+                    .font(.system(.body, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .help("배속을 적용한 저장 결과 — 길이와 프레임레이트")
+            }
 
             Spacer()
 
@@ -259,11 +278,13 @@ struct EditorView: View {
         guard panel.runModal() == .OK, let outputURL = panel.url else { return }
 
         let keptRanges = state.segments.map(\.sourceRange)
-        let useEffects = state.cropAspect != .none || !state.mosaicRegions.isEmpty
+        let useEffects = usesReencodePath
         state.isExporting = true
         state.exportProgress = 0
         state.exportETA = nil
-        state.exportMessage = useEffects ? "HDR 보존 재인코딩 중…" : "무손실 저장 중…"
+        state.exportMessage = state.speed != .normal
+            ? "\(state.speed.rawValue) 배속 재인코딩 중…"
+            : (useEffects ? "HDR 보존 재인코딩 중…" : "무손실 저장 중…")
 
         let exportStart = Date()
         state.exportTask = Task {
@@ -276,6 +297,7 @@ struct EditorView: View {
                         displaySize: state.displaySize,
                         levels: state.levels,
                         mosaicRegions: state.mosaicRegions,
+                        speed: state.speed.value,
                         to: outputURL
                     ) { progress in
                         Task { @MainActor in
@@ -352,10 +374,10 @@ struct EditorView: View {
         onOpenProject(url)
     }
 
-    /// crop이나 모자이크 중 하나라도 있으면 재인코딩 경로(ReencodeExporter)를 타므로
-    /// 퍼센트 진행률/취소가 의미 있다. 둘 다 없으면 무손실 스트림 복사라 진행률을 알 수 없다.
+    /// crop·모자이크·배속 중 하나라도 있으면 재인코딩 경로(ReencodeExporter)를 타므로
+    /// 퍼센트 진행률/취소가 의미 있다. 셋 다 없으면 무손실 스트림 복사라 진행률을 알 수 없다.
     private var usesReencodePath: Bool {
-        state.cropAspect != .none || !state.mosaicRegions.isEmpty
+        state.cropAspect != .none || !state.mosaicRegions.isEmpty || state.speed != .normal
     }
 
     @ViewBuilder

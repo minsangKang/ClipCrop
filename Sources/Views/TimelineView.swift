@@ -4,6 +4,7 @@ import SwiftUI
 
 /// 남은 세그먼트들을 비례 폭의 블록으로 표시하는 타임라인.
 /// 클릭: 해당 위치로 시크 + 세그먼트 선택. 드래그: 스크럽.
+/// 선택된 구간의 양 끝을 드래그하면 잘려 나간 원본까지 늘이거나 줄일 수 있다(트림).
 /// 확대/축소: 세로 스크롤(위로 = 확대), ⌘= / ⌘-, 슬라이더. ⌘0은 전체 보기. 가로 스크롤은 이동.
 struct TimelineView: View {
     @ObservedObject var state: EditState
@@ -19,18 +20,31 @@ struct TimelineView: View {
     @State private var scrollOffsetX: CGFloat = 0
     @State private var viewportWidth: CGFloat = 0
     @State private var isScrubbing = false
+    @State private var trimDrag: TrimDrag?
+
+    /// 진행 중인 트림 드래그. 드래그 동안은 1초당 폭을 고정해서, 구간이 길어져도
+    /// 타임라인 전체가 다시 축소되며 손잡이가 커서에서 도망가지 않게 한다.
+    private struct TrimDrag {
+        let segmentID: UUID
+        let edge: EditState.TrimEdge
+        let originalRange: CMTimeRange
+        let pointsPerSecond: CGFloat
+    }
 
     var body: some View {
         VStack(spacing: 4) {
             zoomBar
             GeometryReader { geo in
                 let viewport = geo.size.width
-                let contentWidth = viewport * zoom
                 let total = state.totalDuration.seconds
+                let contentWidth = trimDrag.map { CGFloat(total) * $0.pointsPerSecond } ?? viewport * zoom
+                let shift = trimShift
                 VStack(spacing: 0) {
-                    ruler(viewport: viewport, contentWidth: contentWidth, total: total)
+                    ruler(viewport: viewport, contentWidth: contentWidth, total: total,
+                          offsetX: scrollOffsetX - shift)
                     ScrollView(.horizontal) {
                         track(contentWidth: contentWidth, total: total)
+                            .offset(x: shift)
                     }
                     .scrollIndicators(zoom > 1 ? .visible : .hidden)
                     .scrollPosition($scrollPosition)
@@ -49,7 +63,9 @@ struct TimelineView: View {
             .frame(height: rulerHeight + barHeight + 10)
         }
         .onChange(of: state.currentTime) { _, _ in followPlayhead() }
-        .onChange(of: state.totalDuration) { _, _ in setZoom(zoom, anchorX: nil) }
+        .onChange(of: state.totalDuration) { _, _ in
+            if trimDrag == nil { setZoom(zoom, anchorX: nil) }
+        }
     }
 
     // MARK: - 확대/축소 컨트롤
@@ -132,7 +148,7 @@ struct TimelineView: View {
 
     /// 재생 중 재생헤드가 화면 밖으로 나가면 한 화면씩 넘겨 따라간다.
     private func followPlayhead() {
-        guard zoom > 1, !isScrubbing, viewportWidth > 0 else { return }
+        guard zoom > 1, !isScrubbing, trimDrag == nil, viewportWidth > 0 else { return }
         let total = state.totalDuration.seconds
         guard total > 0 else { return }
         let contentWidth = viewportWidth * zoom
@@ -145,18 +161,19 @@ struct TimelineView: View {
     // MARK: - 눈금자
 
     /// 보이는 구간만 그린다 — 크게 확대했을 때 전체 폭의 Canvas를 만들지 않기 위해.
-    private func ruler(viewport: CGFloat, contentWidth: CGFloat, total: Double) -> some View {
+    private func ruler(viewport: CGFloat, contentWidth: CGFloat, total: Double,
+                       offsetX: CGFloat) -> some View {
         Canvas { context, size in
             guard total > 0, contentWidth > 0 else { return }
             let pointsPerSecond = contentWidth / CGFloat(total)
             let major = Self.tickInterval(pointsPerSecond: pointsPerSecond)
             let minor = major / 5
-            let startTime = Double(scrollOffsetX / pointsPerSecond)
-            let endTime = Double((scrollOffsetX + size.width) / pointsPerSecond)
+            let startTime = Double(offsetX / pointsPerSecond)
+            let endTime = Double((offsetX + size.width) / pointsPerSecond)
 
             var t = (startTime / minor).rounded(.down) * minor
             while t <= min(endTime, total) + minor / 2 {
-                let x = CGFloat(t) * pointsPerSecond - scrollOffsetX
+                let x = CGFloat(t) * pointsPerSecond - offsetX
                 let isMajor = abs((t / major).rounded() * major - t) < minor / 2
                 let tickHeight: CGFloat = isMajor ? 7 : 3
                 context.fill(Path(CGRect(x: x, y: size.height - tickHeight, width: 1, height: tickHeight)),
@@ -201,7 +218,7 @@ struct TimelineView: View {
         .gesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { value in
-                    guard total > 0 else { return }
+                    guard total > 0, trimDrag == nil else { return }
                     isScrubbing = true
                     let fraction = min(max(value.location.x / contentWidth, 0), 1)
                     let t = CMTime(seconds: fraction * total, preferredTimescale: 600)
@@ -227,9 +244,81 @@ struct TimelineView: View {
                                           lineWidth: isSelected ? 2 : 1)
                     )
                     .frame(width: max(4, width * fraction - gap))
+                    .overlay(alignment: .leading) {
+                        if isSelected { trimHandle(for: seg, edge: .start) }
+                    }
+                    .overlay(alignment: .trailing) {
+                        if isSelected { trimHandle(for: seg, edge: .end) }
+                    }
             }
         }
         .frame(height: barHeight)
+    }
+
+    // MARK: - 트림 손잡이
+
+    /// 시작점을 왼쪽으로 늘이면 구간은 오른쪽으로 자라므로, 그만큼 트랙 전체를 왼쪽으로 밀어서
+    /// 잡고 있는 경계가 커서를 따라오게 한다. 놓으면 같은 양만큼 스크롤로 옮겨 화면이 튀지 않는다.
+    private var trimShift: CGFloat {
+        guard let trimDrag, trimDrag.edge == .start,
+              let seg = state.segments.first(where: { $0.id == trimDrag.segmentID }) else { return 0 }
+        let added = trimDrag.originalRange.start.seconds - seg.sourceRange.start.seconds
+        return -CGFloat(added) * trimDrag.pointsPerSecond
+    }
+
+    private func trimHandle(for seg: Segment, edge: EditState.TrimEdge) -> some View {
+        let isActive = trimDrag?.segmentID == seg.id && trimDrag?.edge == edge
+        return ZStack {
+            Color.clear
+            Capsule()
+                .fill(Color.white.opacity(isActive ? 1 : 0.85))
+                .frame(width: 4, height: barHeight * 0.45)
+        }
+        .frame(width: 12, height: barHeight)
+        .contentShape(Rectangle())
+        .pointerStyle(.frameResize(position: edge == .start ? .leading : .trailing))
+        .help(edge == .start ? "드래그해서 시작점 조정" : "드래그해서 끝점 조정")
+        .gesture(
+            // 드래그하는 동안 트랙이 움직이므로 위치가 고정된 전역 좌표로 이동량을 잰다
+            // minimumDistance 0으로 눌린 순간부터 손잡이가 이벤트를 가져가서 아래 스크럽이 끼어들지 않게 한다.
+            DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                .onChanged { value in
+                    if trimDrag == nil {
+                        // 클릭만 하고 움직이지 않으면 트림을 시작하지 않는다(미리보기 재구성 방지)
+                        guard value.translation.width != 0 else { return }
+                        let total = state.totalDuration.seconds
+                        guard total > 0, viewportWidth > 0 else { return }
+                        trimDrag = TrimDrag(segmentID: seg.id, edge: edge,
+                                            originalRange: seg.sourceRange,
+                                            pointsPerSecond: viewportWidth * zoom / CGFloat(total))
+                        state.beginTrim()
+                    }
+                    guard let trimDrag else { return }
+                    state.trim(segmentID: trimDrag.segmentID, edge: trimDrag.edge,
+                               originalRange: trimDrag.originalRange,
+                               delta: Double(value.translation.width / trimDrag.pointsPerSecond))
+                }
+                .onEnded { _ in finishTrim() }
+        )
+    }
+
+    /// 드래그 동안 고정했던 1초당 폭을 배율로 되돌리고, 트랙을 밀어둔 만큼 스크롤로 옮긴다.
+    private func finishTrim() {
+        guard let drag = trimDrag else { return }
+        let shift = trimShift
+        let total = CGFloat(state.totalDuration.seconds)
+        trimDrag = nil
+        state.endTrim()
+        guard viewportWidth > 0, total > 0 else { return }
+
+        let newZoom = min(max(total * drag.pointsPerSecond / viewportWidth, 1), maxZoom)
+        let newContent = viewportWidth * newZoom
+        let newOffset = min(max(scrollOffsetX - shift, 0), max(newContent - viewportWidth, 0))
+        zoom = newZoom
+        scrollOffsetX = newOffset
+        DispatchQueue.main.async {
+            scrollPosition.scrollTo(x: newOffset)
+        }
     }
 
     private func playhead(width: CGFloat, total: Double) -> some View {

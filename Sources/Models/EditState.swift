@@ -95,7 +95,11 @@ final class EditState: ObservableObject {
             timeObserver = player.addPeriodicTimeObserver(
                 forInterval: CMTime(value: 1, timescale: 30), queue: .main
             ) { [weak self] time in
-                Task { @MainActor in self?.currentTime = time }
+                Task { @MainActor in
+                    // 트림 중엔 플레이어가 원본 영상을 재생하므로 그 시간은 컴포지션 시간이 아니다
+                    guard let self, !self.isTrimming else { return }
+                    self.currentTime = time
+                }
             }
             endObserver = NotificationCenter.default.addObserver(
                 forName: AVPlayerItem.didPlayToEndTimeNotification,
@@ -240,6 +244,66 @@ final class EditState: ObservableObject {
         segments.remove(at: index)
         selectedSegmentID = nil
         Task { await rebuildPlayerItem(seekTo: deletedStart) }
+    }
+
+    // MARK: - 트림 (구간 양 끝 드래그로 늘이기/줄이기)
+
+    enum TrimEdge { case start, end }
+
+    /// 트림 시작 직전 상태. 드래그가 끝나면 한 번의 되돌리기 단위로 쌓는다.
+    private var trimBaseline: UndoSnapshot?
+    var isTrimming: Bool { trimBaseline != nil }
+
+    /// 드래그 동안은 미리보기를 원본 영상 전체로 바꿔서 잘려 나간 구간의 프레임도 볼 수 있게 한다.
+    func beginTrim() {
+        guard trimBaseline == nil else { return }
+        if isPlaying {
+            player.pause()
+            isPlaying = false
+        }
+        trimBaseline = currentSnapshot
+        let item = AVPlayerItem(asset: asset)
+        player.replaceCurrentItem(with: item)
+        Task { item.videoComposition = try? await makePreviewVideoComposition(for: asset) }
+    }
+
+    /// 드래그 시작 시점의 구간(originalRange)에서 delta초만큼 한쪽 끝을 옮긴다.
+    /// 원본 영상 범위 안이라면 다른 구간과 겹쳐도 된다 — 각 구간은 원본의 독립된 일부라서.
+    func trim(segmentID: UUID, edge: TrimEdge, originalRange: CMTimeRange, delta: Double) {
+        guard isTrimming, let index = segments.firstIndex(where: { $0.id == segmentID }) else { return }
+        let minDuration = 1.0 / 30
+        let start = originalRange.start.seconds
+        let end = originalRange.end.seconds
+        let range: CMTimeRange
+        switch edge {
+        case .start:
+            let newStart = min(max(start + delta, 0), end - minDuration)
+            range = CMTimeRange(start: CMTime(seconds: newStart, preferredTimescale: 600),
+                                end: originalRange.end)
+        case .end:
+            let newEnd = min(max(end + delta, start + minDuration), sourceDuration.seconds)
+            range = CMTimeRange(start: originalRange.start,
+                                end: CMTime(seconds: newEnd, preferredTimescale: 600))
+        }
+        segments[index].sourceRange = range
+
+        // 재생헤드는 컴포지션 기준 경계에, 미리보기는 원본 기준 경계 프레임에 맞춘다
+        let compStart = compositionStart(of: segments[index])
+        currentTime = edge == .start ? compStart : CMTimeAdd(compStart, range.duration)
+        let frame = CMTime(seconds: 1 / max(sourceFPS, 1), preferredTimescale: 600)
+        let sourceEdge = edge == .start ? range.start : CMTimeSubtract(range.end, frame)
+        player.seek(to: sourceEdge, toleranceBefore: .zero, toleranceAfter: .zero)
+    }
+
+    func endTrim() {
+        guard let baseline = trimBaseline else { return }
+        trimBaseline = nil
+        if segments != baseline.segments {
+            undoStack.append(baseline)
+            redoStack.removeAll()
+            updateUndoFlags()
+        }
+        Task { await rebuildPlayerItem(seekTo: currentTime) }
     }
 
     func seek(toCompositionTime t: CMTime) {

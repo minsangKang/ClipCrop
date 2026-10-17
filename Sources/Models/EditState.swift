@@ -246,6 +246,20 @@ final class EditState: ObservableObject {
         Task { await rebuildPlayerItem(seekTo: deletedStart) }
     }
 
+    /// 구간 순서 변경. toIndex는 옮길 구간을 뺀 나머지 배열 기준 삽입 위치.
+    func moveSegment(id: UUID, toIndex: Int) {
+        guard let from = segments.firstIndex(where: { $0.id == id }) else { return }
+        var reordered = segments
+        let seg = reordered.remove(at: from)
+        let to = min(max(toIndex, 0), reordered.count)
+        guard to != from else { return }
+        pushUndoSnapshot()
+        reordered.insert(seg, at: to)
+        segments = reordered
+        selectedSegmentID = id
+        Task { await rebuildPlayerItem(seekTo: compositionStart(of: seg)) }
+    }
+
     // MARK: - 트림 (구간 양 끝 드래그로 늘이기/줄이기)
 
     enum TrimEdge { case start, end }

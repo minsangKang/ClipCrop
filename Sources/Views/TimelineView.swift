@@ -5,6 +5,7 @@ import SwiftUI
 /// 남은 세그먼트들을 비례 폭의 블록으로 표시하는 타임라인.
 /// 클릭: 해당 위치로 시크 + 세그먼트 선택. 드래그: 스크럽.
 /// 선택된 구간의 양 끝을 드래그하면 잘려 나간 원본까지 늘이거나 줄일 수 있다(트림).
+/// 구간을 꾹 누른 채 드래그하면 순서를 바꿀 수 있다.
 /// 확대/축소: 세로 스크롤(위로 = 확대), ⌘= / ⌘-, 슬라이더. ⌘0은 전체 보기. 가로 스크롤은 이동.
 struct TimelineView: View {
     @ObservedObject var state: EditState
@@ -21,6 +22,12 @@ struct TimelineView: View {
     @State private var viewportWidth: CGFloat = 0
     @State private var isScrubbing = false
     @State private var trimDrag: TrimDrag?
+    @State private var reorder: ReorderDrag?
+    /// 뷰포트 기준 커서 x. 자동 스크롤로 콘텐츠만 움직일 때도 블록이 커서 아래에 머물도록 뷰포트 기준으로 둔다.
+    @State private var reorderPointerX: CGFloat = 0
+    @State private var pressStart: CGPoint?
+    @State private var pressTask: Task<Void, Never>?
+    @State private var autoScrollTask: Task<Void, Never>?
 
     /// 진행 중인 트림 드래그. 드래그 동안은 1초당 폭을 고정해서, 구간이 길어져도
     /// 타임라인 전체가 다시 축소되며 손잡이가 커서에서 도망가지 않게 한다.
@@ -148,7 +155,7 @@ struct TimelineView: View {
 
     /// 재생 중 재생헤드가 화면 밖으로 나가면 한 화면씩 넘겨 따라간다.
     private func followPlayhead() {
-        guard zoom > 1, !isScrubbing, trimDrag == nil, viewportWidth > 0 else { return }
+        guard zoom > 1, !isScrubbing, trimDrag == nil, reorder == nil, viewportWidth > 0 else { return }
         let total = state.totalDuration.seconds
         guard total > 0 else { return }
         let contentWidth = viewportWidth * zoom
@@ -208,6 +215,8 @@ struct TimelineView: View {
 
     // MARK: - 트랙
 
+    /// 클릭은 시크, 바로 드래그하면 스크럽, 꾹 누르고 있다가 드래그하면 구간 순서 변경.
+    /// 길게 누르기를 별도 제스처로 두면 스크럽과 서로 이벤트를 다투므로 하나의 드래그 안에서 구분한다.
     private func track(contentWidth: CGFloat, total: Double) -> some View {
         ZStack(alignment: .topLeading) {
             segmentBlocks(width: contentWidth, total: total)
@@ -215,27 +224,167 @@ struct TimelineView: View {
         }
         .frame(width: contentWidth, height: barHeight, alignment: .leading)
         .contentShape(Rectangle())
+        .pointerStyle(reorder != nil ? .grabActive : nil)
         .gesture(
             DragGesture(minimumDistance: 0)
                 .onChanged { value in
                     guard total > 0, trimDrag == nil else { return }
-                    isScrubbing = true
-                    let fraction = min(max(value.location.x / contentWidth, 0), 1)
-                    let t = CMTime(seconds: fraction * total, preferredTimescale: 600)
-                    state.seek(toCompositionTime: t)
-                    if let seg = state.segment(atCompositionTime: t) {
-                        state.selectedSegmentID = seg.id
+                    if reorder != nil {
+                        reorderPointerX = value.location.x - scrollOffsetX
+                        updateReorderTarget(width: contentWidth, total: total)
+                        return
                     }
+                    if pressStart == nil {
+                        pressStart = value.location
+                        schedulePressLift(at: value.location, width: contentWidth, total: total)
+                    } else if let start = pressStart, !isScrubbing,
+                              hypot(value.location.x - start.x, value.location.y - start.y) > 4 {
+                        // 길게 누르기 전에 움직였으면 스크럽으로 확정
+                        pressTask?.cancel()
+                        isScrubbing = true
+                    }
+                    scrub(to: value.location.x, width: contentWidth, total: total)
                 }
-                .onEnded { _ in isScrubbing = false }
+                .onEnded { _ in
+                    pressTask?.cancel()
+                    pressStart = nil
+                    isScrubbing = false
+                    if reorder != nil { dropReorder() }
+                }
         )
     }
 
+    private func scrub(to x: CGFloat, width: CGFloat, total: Double) {
+        let fraction = min(max(x / width, 0), 1)
+        let t = CMTime(seconds: fraction * total, preferredTimescale: 600)
+        state.seek(toCompositionTime: t)
+        if let seg = state.segment(atCompositionTime: t) {
+            state.selectedSegmentID = seg.id
+        }
+    }
+
+    // MARK: - 구간 순서 변경 (꾹 눌러 드래그)
+
+    /// 들어 올린 구간. 나머지 구간들은 targetIndex 자리에 빈칸을 두고 배치된다.
+    private struct ReorderDrag {
+        let segmentID: UUID
+        /// 잡은 지점과 블록 왼쪽 끝의 거리 — 블록이 커서에 붙어 같이 움직이도록
+        let grabOffset: CGFloat
+        var targetIndex: Int
+    }
+
+    private func schedulePressLift(at location: CGPoint, width: CGFloat, total: Double) {
+        pressTask?.cancel()
+        pressTask = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled, pressStart != nil, !isScrubbing, state.segments.count > 1,
+                  let frame = blockFrames(width: width, total: total)
+                      .first(where: { location.x >= $0.x && location.x < $0.x + $0.width }),
+                  let index = state.segments.firstIndex(where: { $0.id == frame.segment.id }) else { return }
+            state.selectedSegmentID = frame.segment.id
+            reorderPointerX = location.x - scrollOffsetX
+            withAnimation(.spring(duration: 0.25)) {
+                reorder = ReorderDrag(segmentID: frame.segment.id,
+                                      grabOffset: location.x - frame.x,
+                                      targetIndex: index)
+            }
+            startReorderAutoScroll(width: width, total: total)
+        }
+    }
+
+    /// 들어 올린 블록의 왼쪽 끝에 가장 가까운 빈칸 자리를 고른다. 나머지 구간만으로 계산한
+    /// 경계를 쓰므로, 빈칸이 움직여도 기준이 흔들리지 않아 자리가 왔다 갔다 하지 않는다.
+    private func updateReorderTarget(width: CGFloat, total: Double) {
+        guard let drag = reorder else { return }
+        let pps = width / CGFloat(total)
+        let draggedLeft = reorderPointerX + scrollOffsetX - drag.grabOffset
+        var boundaries: [CGFloat] = [0]
+        for seg in state.segments where seg.id != drag.segmentID {
+            boundaries.append(boundaries.last! + CGFloat(seg.sourceRange.duration.seconds) * pps)
+        }
+        let target = boundaries.indices.min { abs(boundaries[$0] - draggedLeft) < abs(boundaries[$1] - draggedLeft) } ?? 0
+        if target != drag.targetIndex {
+            withAnimation(.spring(duration: 0.3, bounce: 0.15)) {
+                reorder?.targetIndex = target
+            }
+        }
+    }
+
+    private func dropReorder() {
+        guard let drag = reorder else { return }
+        autoScrollTask?.cancel()
+        withAnimation(.spring(duration: 0.3, bounce: 0.15)) {
+            reorder = nil
+            state.moveSegment(id: drag.segmentID, toIndex: drag.targetIndex)
+        }
+    }
+
+    /// 확대 상태에서 블록을 화면 가장자리로 끌고 가면 그 방향으로 계속 스크롤한다.
+    /// 마우스가 멈춰 있으면 드래그 이벤트가 오지 않으므로 별도 루프로 돌린다.
+    private func startReorderAutoScroll(width: CGFloat, total: Double) {
+        autoScrollTask?.cancel()
+        autoScrollTask = Task { @MainActor in
+            while !Task.isCancelled, reorder != nil {
+                let edge: CGFloat = 32
+                var step: CGFloat = 0
+                if reorderPointerX < edge {
+                    step = -(edge - reorderPointerX) / 3
+                } else if reorderPointerX > viewportWidth - edge {
+                    step = (reorderPointerX - (viewportWidth - edge)) / 3
+                }
+                let maxOffset = max(width - viewportWidth, 0)
+                let next = min(max(scrollOffsetX + step, 0), maxOffset)
+                if next != scrollOffsetX {
+                    scrollOffsetX = next
+                    scrollPosition.scrollTo(x: next)
+                    updateReorderTarget(width: width, total: total)
+                }
+                try? await Task.sleep(for: .milliseconds(16))
+            }
+        }
+    }
+
+    // MARK: - 구간 블록
+
+    private struct BlockFrame {
+        let segment: Segment
+        let x: CGFloat
+        let width: CGFloat
+    }
+
+    /// 각 구간 블록의 위치. 순서 변경 중이면 들어 올린 블록은 커서를 따르고,
+    /// 나머지는 targetIndex에 그 블록 폭만큼 빈칸을 두고 줄을 선다.
+    private func blockFrames(width: CGFloat, total: Double) -> [BlockFrame] {
+        guard total > 0 else { return [] }
+        let pps = width / CGFloat(total)
+        let widthOf = { (seg: Segment) in CGFloat(seg.sourceRange.duration.seconds) * pps }
+
+        guard let drag = reorder, let dragged = state.segments.first(where: { $0.id == drag.segmentID }) else {
+            var x: CGFloat = 0
+            return state.segments.map { seg in
+                defer { x += widthOf(seg) }
+                return BlockFrame(segment: seg, x: x, width: widthOf(seg))
+            }
+        }
+
+        var frames: [BlockFrame] = []
+        var x: CGFloat = 0
+        for (i, seg) in state.segments.filter({ $0.id != drag.segmentID }).enumerated() {
+            if i == drag.targetIndex { x += widthOf(dragged) }
+            frames.append(BlockFrame(segment: seg, x: x, width: widthOf(seg)))
+            x += widthOf(seg)
+        }
+        let draggedX = reorderPointerX + scrollOffsetX - drag.grabOffset
+        frames.append(BlockFrame(segment: dragged, x: draggedX, width: widthOf(dragged)))
+        return frames
+    }
+
     private func segmentBlocks(width: CGFloat, total: Double) -> some View {
-        HStack(spacing: gap) {
-            ForEach(state.segments) { seg in
-                let fraction = total > 0 ? seg.sourceRange.duration.seconds / total : 0
+        ZStack(alignment: .topLeading) {
+            ForEach(blockFrames(width: width, total: total), id: \.segment.id) { frame in
+                let seg = frame.segment
                 let isSelected = state.selectedSegmentID == seg.id
+                let isLifted = reorder?.segmentID == seg.id
                 RoundedRectangle(cornerRadius: 6)
                     .fill(isSelected ? Color.accentColor.opacity(0.55) : Color.gray.opacity(0.35))
                     .overlay(
@@ -243,16 +392,24 @@ struct TimelineView: View {
                             .strokeBorder(isSelected ? Color.accentColor : Color.gray.opacity(0.6),
                                           lineWidth: isSelected ? 2 : 1)
                     )
-                    .frame(width: max(4, width * fraction - gap))
+                    .frame(width: max(4, frame.width - gap), height: barHeight)
                     .overlay(alignment: .leading) {
-                        if isSelected { trimHandle(for: seg, edge: .start) }
+                        if isSelected && reorder == nil { trimHandle(for: seg, edge: .start) }
                     }
                     .overlay(alignment: .trailing) {
-                        if isSelected { trimHandle(for: seg, edge: .end) }
+                        if isSelected && reorder == nil { trimHandle(for: seg, edge: .end) }
                     }
+                    .scaleEffect(isLifted ? 1.04 : 1)
+                    .shadow(color: .black.opacity(isLifted ? 0.5 : 0), radius: isLifted ? 8 : 0, y: isLifted ? 3 : 0)
+                    .opacity(isLifted ? 0.9 : 1)
+                    .animation(.spring(duration: 0.25), value: isLifted)
+                    .offset(x: frame.x, y: isLifted ? -3 : 0)
+                    // 들어 올린 블록은 커서를 그대로 따라가야 하므로 위치 변화엔 애니메이션을 끈다
+                    .transaction { if isLifted { $0.animation = nil } }
+                    .zIndex(isLifted ? 1 : 0)
             }
         }
-        .frame(height: barHeight)
+        .frame(width: width, height: barHeight, alignment: .topLeading)
     }
 
     // MARK: - 트림 손잡이

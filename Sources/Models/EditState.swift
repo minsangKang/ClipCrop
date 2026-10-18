@@ -21,9 +21,21 @@ final class EditState: ObservableObject {
         didSet { resetCropRect() }
     }
     /// 영상 표시 영역 기준 정규화(0~1) crop 사각형. 좌상단 원점.
-    @Published var cropRect = CGRect(x: 0, y: 0, width: 1, height: 1) {
-        didSet { updatePreviewVideoComposition() }
+    /// 미리보기는 crop을 적용하지 않고 전체 프레임을 그대로 재생하므로(아래 주석 참고)
+    /// 이 값이 바뀌어도 컴포지션을 다시 만들 필요가 없다 — 흰 박스 오버레이만 움직인다.
+    @Published var cropRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+    /// crop 박스의 세로 위치. 0 = 맨 위, 0.5 = 정중앙, 1 = 맨 아래.
+    /// 구간별이 아니라 프로젝트 영상 전체에 적용되는 값이고, 비율을 바꿔도 유지된다.
+    @Published var cropVerticalPosition: Double = 0.5 {
+        didSet {
+            guard !isSyncingCropPosition else { return }
+            applyCropVerticalPosition()
+        }
     }
+    private var isSyncingCropPosition = false
+
+    /// 위아래로 움직일 여유가 있는지 (crop이 높이를 꽉 채우면 세로 조정이 의미 없다)
+    var cropCanMoveVertically: Bool { cropAspect != .none && 1 - cropRect.height > 0.001 }
     /// crop 후 물빠진 색을 보정하는 톤 조정(LumaFusion "레벨"의 입력 검은점/흰점/감마).
     /// 미리보기와 내보내기가 CropVideoComposition을 공유해서 쓰므로, 편집 화면에서
     /// 눈으로 맞춘 값이 내보내기 결과에 그대로 반영된다.
@@ -352,7 +364,23 @@ final class EditState: ObservableObject {
         } else {
             w = ratio / videoRatio          // 상하 꽉 채우고 좌우를 줄임
         }
-        cropRect = CGRect(x: (1 - w) / 2, y: (1 - h) / 2, width: w, height: h)
+        cropRect = CGRect(x: (1 - w) / 2, y: (1 - h) * cropVerticalPosition, width: w, height: h)
+    }
+
+    /// 세로 위치 슬라이더 값을 현재 crop 사각형에 반영
+    private func applyCropVerticalPosition() {
+        let slack = 1 - cropRect.height
+        guard cropAspect != .none, slack > 0.001 else { return }
+        cropRect.origin.y = slack * min(max(cropVerticalPosition, 0), 1)
+    }
+
+    /// 플레이어에서 crop 박스를 직접 끌어 옮겼을 때, 슬라이더 값을 그 위치에 맞춘다.
+    /// (슬라이더 → 사각형 반영이 다시 돌지 않게 동기화 중임을 표시한다.)
+    func syncCropVerticalPosition() {
+        let slack = 1 - cropRect.height
+        isSyncingCropPosition = true
+        cropVerticalPosition = slack > 0.001 ? min(max(cropRect.minY / slack, 0), 1) : 0.5
+        isSyncingCropPosition = false
     }
 
     // MARK: - 모자이크
@@ -414,6 +442,7 @@ final class EditState: ObservableObject {
         if cropAspect != .none {
             cropRect = CGRect(x: project.cropRect.x, y: project.cropRect.y,
                               width: project.cropRect.width, height: project.cropRect.height)
+            syncCropVerticalPosition()
         }
         Task { await rebuildPlayerItem(seekTo: .zero) }
     }
@@ -437,21 +466,25 @@ final class EditState: ObservableObject {
         }
     }
 
-    /// crop도 모자이크도 없으면 nil(원본 그대로 재생), 하나라도 있으면 내보내기와 동일한
-    /// CropVideoComposition을 적용해 실제로 어떻게 나올지 미리 보여준다.
-    /// crop을 안 쓸 때도 cropRect는 항상 (0,0,1,1)(전체 프레임)이라 pixelCrop 계산이 그대로 통한다.
+    /// 미리보기 컴포지션은 **crop을 적용하지 않고** 항상 전체 프레임을 렌더링한다.
+    /// crop까지 적용해버리면 renderSize가 crop 크기로 줄어드는데, 플레이어 프레임은 원본
+    /// 비율(videoRect)이라 그 결과물이 가운데 letterbox로 들어가버린다. 그러면 crop이 정중앙일
+    /// 때만 우연히 흰 박스와 겹치고, 위아래로 옮기는 순간 "하이라이팅 영역"과 실제 화면이
+    /// 어긋나 보인다. 전체 프레임을 그대로 재생하면 흰 박스가 잘려 나갈 영역을 정확히 가리킨다
+    /// (사진·Final Cut의 crop UI와 동일 — 박스 바깥도 보이고 딤 처리로 구분된다).
+    /// 톤 조정·모자이크는 픽셀 단위 효과라 crop 여부와 무관하게 내보내기와 같은 결과를 보여준다.
     private func makePreviewVideoComposition(for composition: AVAsset) async throws -> AVVideoComposition? {
-        guard cropAspect != .none || !mosaicRegions.isEmpty,
+        guard !levels.isNeutral || !mosaicRegions.isEmpty,
               let videoTrack = try await composition.loadTracks(withMediaType: .video).first else {
             return nil
         }
-        let pixelCrop = VideoGeometry.pixelCropRect(normalized: cropRect, displaySize: displaySize)
+        let fullFrame = CGRect(origin: .zero, size: displaySize)
         return try await CropVideoComposition.make(asset: composition, videoTrack: videoTrack,
-                                                    pixelCrop: pixelCrop, displaySize: displaySize,
+                                                    pixelCrop: fullFrame, displaySize: displaySize,
                                                     levels: levels, mosaicRegions: mosaicRegions)
     }
 
-    /// crop, 레벨, 모자이크 중 하나라도 바뀌었을 때, 플레이어 아이템을 새로 만들지 않고
+    /// 레벨이나 모자이크가 바뀌었을 때, 플레이어 아이템을 새로 만들지 않고
     /// videoComposition만 다시 계산해 끊김 없이 미리보기에 반영한다.
     private func updatePreviewVideoComposition() {
         guard let item = player.currentItem else { return }

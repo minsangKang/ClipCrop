@@ -5,8 +5,14 @@ import SwiftUI
 struct CropOverlayView: View {
     @ObservedObject var state: EditState
     let videoRect: CGRect
+    /// 미리보기가 crop 영역만 꽉 채워 보여주는 상태인지. 이때는 바깥에 덮을 영상이 없어
+    /// 딤 처리를 끄고, 드래그는 "박스를 옮기는" 게 아니라 "영상을 미는" 방향으로 뒤집는다.
+    var fillsPreview = false
 
     @State private var dragStartRect: CGRect?
+    /// 드래그 시작 시점의 videoRect. crop을 옮기면 미리보기도 같이 확대·이동하므로,
+    /// 그때그때의 videoRect로 좌표를 환산하면 기준이 흔들려 사각형이 폭주한다.
+    @State private var dragStartVideoRect: CGRect?
 
     private let handleSize: CGFloat = 14
     private let minSidePoints: CGFloat = 48
@@ -14,7 +20,7 @@ struct CropOverlayView: View {
     var body: some View {
         let rect = viewRect(from: state.cropRect)
         ZStack(alignment: .topLeading) {
-            dimOutside(cropRect: rect)
+            if !fillsPreview { dimOutside(cropRect: rect) }
             Rectangle()
                 .strokeBorder(Color.white, lineWidth: 1.5)
                 .background(Color.clear)
@@ -31,18 +37,32 @@ struct CropOverlayView: View {
 
     // MARK: - 좌표 변환
 
+    /// 드래그 중에는 시작 시점의 프레임으로 고정해서 환산한다.
+    private var frame: CGRect { dragStartVideoRect ?? videoRect }
+
     private func viewRect(from normalized: CGRect) -> CGRect {
-        CGRect(x: videoRect.minX + normalized.minX * videoRect.width,
-               y: videoRect.minY + normalized.minY * videoRect.height,
-               width: normalized.width * videoRect.width,
-               height: normalized.height * videoRect.height)
+        CGRect(x: frame.minX + normalized.minX * frame.width,
+               y: frame.minY + normalized.minY * frame.height,
+               width: normalized.width * frame.width,
+               height: normalized.height * frame.height)
     }
 
     private func normalizedRect(from view: CGRect) -> CGRect {
-        CGRect(x: (view.minX - videoRect.minX) / videoRect.width,
-               y: (view.minY - videoRect.minY) / videoRect.height,
-               width: view.width / videoRect.width,
-               height: view.height / videoRect.height)
+        CGRect(x: (view.minX - frame.minX) / frame.width,
+               y: (view.minY - frame.minY) / frame.height,
+               width: view.width / frame.width,
+               height: view.height / frame.height)
+    }
+
+    private func beginDragIfNeeded() {
+        guard dragStartRect == nil else { return }
+        dragStartVideoRect = videoRect
+        dragStartRect = viewRect(from: state.cropRect)
+    }
+
+    private func endDrag() {
+        dragStartRect = nil
+        dragStartVideoRect = nil
     }
 
     // MARK: - 이동
@@ -50,14 +70,19 @@ struct CropOverlayView: View {
     private var moveGesture: some Gesture {
         DragGesture(minimumDistance: 1)
             .onChanged { value in
-                if dragStartRect == nil { dragStartRect = viewRect(from: state.cropRect) }
+                beginDragIfNeeded()
                 guard let start = dragStartRect else { return }
-                var moved = start.offsetBy(dx: value.translation.width, dy: value.translation.height)
-                moved.origin.x = min(max(moved.minX, videoRect.minX), videoRect.maxX - moved.width)
-                moved.origin.y = min(max(moved.minY, videoRect.minY), videoRect.maxY - moved.height)
+                // crop 영역만 보일 땐 잡고 있는 게 박스가 아니라 영상이라, 손가락을 따라
+                // 영상이 움직이도록 crop 박스는 반대로 옮긴다.
+                let sign: CGFloat = fillsPreview ? -1 : 1
+                var moved = start.offsetBy(dx: sign * value.translation.width,
+                                           dy: sign * value.translation.height)
+                moved.origin.x = min(max(moved.minX, frame.minX), frame.maxX - moved.width)
+                moved.origin.y = min(max(moved.minY, frame.minY), frame.maxY - moved.height)
                 state.cropRect = normalizedRect(from: moved)
+                state.syncCropVerticalPosition()
             }
-            .onEnded { _ in dragStartRect = nil }
+            .onEnded { _ in endDrag() }
     }
 
     // MARK: - 코너 핸들
@@ -98,7 +123,7 @@ struct CropOverlayView: View {
     private func resizeGesture(corner: Corner) -> some Gesture {
         DragGesture(minimumDistance: 1)
             .onChanged { value in
-                if dragStartRect == nil { dragStartRect = viewRect(from: state.cropRect) }
+                beginDragIfNeeded()
                 guard let start = dragStartRect,
                       let ratio = state.cropAspect.ratio else { return }
 
@@ -106,8 +131,8 @@ struct CropOverlayView: View {
                 let dragged = value.location
 
                 // 고정점 기준 사용 가능한 최대 폭/높이 (영상 영역 안으로 제한)
-                let maxW = dragged.x > anchor.x ? videoRect.maxX - anchor.x : anchor.x - videoRect.minX
-                let maxH = dragged.y > anchor.y ? videoRect.maxY - anchor.y : anchor.y - videoRect.minY
+                let maxW = dragged.x > anchor.x ? frame.maxX - anchor.x : anchor.x - frame.minX
+                let maxH = dragged.y > anchor.y ? frame.maxY - anchor.y : anchor.y - frame.minY
 
                 // 드래그 거리에서 비율 고정 크기 결정 (폭 기준, 높이 제한 반영)
                 var w = min(abs(dragged.x - anchor.x), maxW)
@@ -119,11 +144,12 @@ struct CropOverlayView: View {
                 let x = dragged.x > anchor.x ? anchor.x : anchor.x - w
                 let y = dragged.y > anchor.y ? anchor.y : anchor.y - h
                 var rect = CGRect(x: x, y: y, width: w, height: h)
-                rect.origin.x = min(max(rect.minX, videoRect.minX), videoRect.maxX - rect.width)
-                rect.origin.y = min(max(rect.minY, videoRect.minY), videoRect.maxY - rect.height)
+                rect.origin.x = min(max(rect.minX, frame.minX), frame.maxX - rect.width)
+                rect.origin.y = min(max(rect.minY, frame.minY), frame.maxY - rect.height)
                 state.cropRect = normalizedRect(from: rect)
+                state.syncCropVerticalPosition()
             }
-            .onEnded { _ in dragStartRect = nil }
+            .onEnded { _ in endDrag() }
     }
 
     // MARK: - 바깥 딤 처리

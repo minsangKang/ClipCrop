@@ -12,6 +12,7 @@ struct EditorView: View {
         VStack(spacing: 0) {
             playerArea
             transportBar
+            cropPositionBar
             levelsBar
             mosaicBar
             TimelineView(state: state)
@@ -44,7 +45,14 @@ struct EditorView: View {
     private var playerArea: some View {
         GeometryReader { geo in
             let bounds = CGRect(origin: .zero, size: geo.size)
-            let videoRect = VideoGeometry.videoRect(displaySize: state.displaySize, in: bounds)
+            // crop 영역이 여백 없이 꽉 차 보이도록 전체 프레임을 확대해 배치하고, 바깥은 잘라낸다.
+            // (미리보기 컴포지션은 전체 프레임을 그대로 렌더링하고 — 그래야 오버레이 좌표가 영상
+            //  픽셀과 1:1로 맞는다 — 보이는 범위만 여기서 crop 영역으로 제한한다.)
+            let videoRect = VideoGeometry.croppedVideoRect(displaySize: state.displaySize,
+                                                           cropRect: state.cropAspect == .none
+                                                               ? CGRect(x: 0, y: 0, width: 1, height: 1)
+                                                               : state.cropRect,
+                                                           in: bounds)
             ZStack(alignment: .topLeading) {
                 // PlayerView 프레임을 videoRect에 정확히 맞춘다 — AVPlayerView가 내부적으로
                 // 따로 letterbox 계산을 하게 두면(.resizeAspect) 창 크기가 실시간으로 바뀔 때
@@ -55,7 +63,7 @@ struct EditorView: View {
                     .frame(width: videoRect.width, height: videoRect.height)
                     .offset(x: videoRect.minX, y: videoRect.minY)
                 if state.cropAspect != .none {
-                    CropOverlayView(state: state, videoRect: videoRect)
+                    CropOverlayView(state: state, videoRect: videoRect, fillsPreview: true)
                         // 모자이크 블록이 있을 땐 crop 드래그가 그 위 터치를 가로채지 않도록 완전히 끈다.
                         .allowsHitTesting(state.mosaicRegions.isEmpty)
                 }
@@ -63,6 +71,10 @@ struct EditorView: View {
                     MosaicOverlayView(state: state, videoRect: videoRect)
                 }
             }
+            // 클립 영역을 플레이어 영역 전체로 고정한다. 이 frame이 없으면 ZStack 크기(=영상
+            // 사각형)가 클립 기준이 돼서, 레터박스가 생기는 상태에선 영상 일부가 잘려 나간다.
+            .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
+            .clipped()      // crop 바깥으로 비어져 나간 프레임은 보이지 않게
         }
         .background(Color.black)
         .padding(.bottom, 8)
@@ -115,6 +127,24 @@ struct EditorView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+    }
+
+    // MARK: - crop 위치 바
+
+    /// crop 박스의 세로 위치를 숫자로 조절한다. 구간별 설정이 아니라 영상 전체에 적용되고,
+    /// 비율을 바꿔도 유지된다. 플레이어 위에서 박스를 끌어 옮겨도 이 값이 같이 움직인다.
+    @ViewBuilder
+    private var cropPositionBar: some View {
+        if state.cropAspect != .none {
+            HStack(spacing: 16) {
+                levelsSlider(title: "세로 위치", value: $state.cropVerticalPosition,
+                             range: 0...1, resetValue: 0.5)
+                    .disabled(!state.cropCanMoveVertically)
+                    .help("0 = 맨 위, 0.5 = 정중앙, 1 = 맨 아래. 영상 전체에 적용됩니다")
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 8)
+        }
     }
 
     // MARK: - 레벨(톤 보정) 바
